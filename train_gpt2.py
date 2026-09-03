@@ -282,10 +282,10 @@ train_loader = DataLoaderLite(B=2, T=512)
 
 torch.set_float32_matmul_precision('high')
 
-# build a fresh, untrained model and run one forward pass to sanity check the output shape
-model = GPT(GPTConfig())
+# build a fresh, untrained model - vocab_size is padded up to a "nicer" number (multiple of 128) for the gpu, the extra slots just go unused
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-# logits, loss = model(x, y)
+model = torch.compile(model) # analyzes and fuses our model's operations ahead of time, so training runs faster
 
 # updates the models weights during training. takes the 'hint' from the gradients and nudges every number in the direction that reduces the error
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -306,6 +306,7 @@ for i in range(50):
     elif device == "mps":
         torch.mps.synchronize() # wait for the GPU to finish work
     t1 = time.time()
-    dt = (t1 - t0)*1000 # time difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = train_loader.B * train_loader.T
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {i:4d} | loss: {loss.item():.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
