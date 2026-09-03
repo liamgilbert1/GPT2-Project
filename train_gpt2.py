@@ -123,6 +123,8 @@ class GPT(nn.Module):
         # One score per possible token in the vocabulary
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+
+
     '''
     Takes the raw token IDs all the way though the embeddings -> 12 blocks of attention + MLP -> final cleanup -> next token score predictions
     In the end, optionally computes how wrong those predictions were, if correct answers are given
@@ -208,22 +210,73 @@ class GPT(nn.Module):
 
 # -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+import os
+import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+'''
+Hands out fresh (x, y) batches from a huge dataset split across many files (shards),
+so we don't have to load the whole dataset into memory or keep reusing the same tiny chunk
+'''
+class DataLoaderLite:
+    def __init__(self, B, T, process_rank, num_processes, split):
+        self.B = B # batch size
+        self.T = T # sequence length
+        self.process_rank = process_rank # which process this is, if training across multiple gpus at once
+        self.num_processes = num_processes # how many processes total, so they can split up the data without overlapping
+        assert split in {'train', 'val'} # train = what we learn from, val = held out data to check performance on
+
+        # finds all the shard files for this split (train or val) and saves them, sorted, as a list
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
+        # starts back at the very first shard, loads its tokens, and sets our starting reading position
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        # grabs the next chunk of tokens and builds our input (x) and target (y) - same as before, y is just x shifted by one
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+
+        # moves our reading position forward, ready for the next call
+        self.current_position += B * T * self.num_processes
+
+        # if there's not enough data left in this shard for another full batch, move on to the next one (looping back to the first if we're at the end)
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
+        return x, y
+
+
+# -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 # picks the fastest hardware available to run on
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
-# load a chunk of training text and tokenize it
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
+# no multi-GPU (DDP) setup yet, so this is always the (only) master process
+master_process = True
 
-# build our input (x) and target (y) batches - y is just x shifted over by one token
-B, T = 4, 32
-buf = torch.tensor(tokens[: B * T + 1])
-x = buf[:-1].view(B, T).to(device)
-y = buf[1:].view(B, T).to(device)
+train_loader = DataLoaderLite(B=4, T=32, process_rank=0, num_processes=1, split='train')
 
 # build a fresh, untrained model and run one forward pass to sanity check the output shape
 model = GPT(GPTConfig())
@@ -235,6 +288,8 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 # repeats the guess, check, adjust cycle 50 times
 for i in range(50):
+    x, y = train_loader.next_batch() # grabs a fresh batch of training data
+    x, y = x.to(device), y.to(device) # moves the data onto the same hardware as the model, so it can be processed
     optimizer.zero_grad() # clears out the old hints from last round, so they don't pile up
     logits, loss = model(x, y) # runs the forward pass, gets our predictions and how wrong they were
     loss.backward() # computes fresh hints (gradients) for every weight, based on this round's error
