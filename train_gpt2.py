@@ -225,65 +225,47 @@ class GPT(nn.Module):
 
 # -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-import os
 import tiktoken
-import numpy as np
-
-def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32) # added after video
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
 
 '''
-Hands out fresh (x, y) batches from a huge dataset split across many files (shards),
-so we don't have to load the whole dataset into memory or keep reusing the same tiny chunk
+Hands out fresh (x, y) batches from a text file, one chunk at a time,
+so the model isn't stuck training on the exact same tokens every step
 '''
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T):
         self.B = B # batch size
         self.T = T # sequence length
-        self.process_rank = process_rank # which process this is, if training across multiple gpus at once
-        self.num_processes = num_processes # how many processes total, so they can split up the data without overlapping
-        assert split in {'train', 'val'} # train = what we learn from, val = held out data to check performance on
 
-        # finds all the shard files for this split (train or val) and saves them, sorted, as a list
-        data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
-        self.shards = shards
-        assert len(shards) > 0, f"no shards found for split {split}"
-        if master_process:
-            print(f"found {len(shards)} shards for split {split}")
-        self.reset()
+        # loads the whole file, tokenizes it once, and keeps it in memory for the rest of training
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches") # how many batches it takes to see every token once
 
-    def reset(self):
-        # starts back at the very first shard, loads its tokens, and sets our starting reading position
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
+        # tracks where we last left off reading, so the next call picks up fresh data
+        self.current_position = 0
 
     def next_batch(self):
-        # grabs the next chunk of tokens and builds our input (x) and target (y) - same as before, y is just x shifted by one
+        # grabs the next chunk of tokens and builds our input (x) and target (y) - y is just x shifted over by one
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
 
         # moves our reading position forward, ready for the next call
-        self.current_position += B * T * self.num_processes
+        self.current_position += B * T
 
-        # if there's not enough data left in this shard for another full batch, move on to the next one (looping back to the first if we're at the end)
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
+        # if there's not enough data left for another full batch, start back over from the beginning
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
         return x, y
 
 
 # -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+import time
 
 # picks the fastest hardware available to run on
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -296,7 +278,9 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 
-train_loader = DataLoaderLite(B=4, T=32, process_rank=0, num_processes=1, split='train')
+train_loader = DataLoaderLite(B=2, T=512)
+
+torch.set_float32_matmul_precision('high')
 
 # build a fresh, untrained model and run one forward pass to sanity check the output shape
 model = GPT(GPTConfig())
@@ -308,10 +292,18 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 # repeats the guess, check, adjust cycle 50 times
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch() # grabs a fresh batch of training data
     x, y = x.to(device), y.to(device) # moves the data onto the same hardware as the model, so it can be processed
     optimizer.zero_grad() # clears out the old hints from last round, so they don't pile up
     logits, loss = model(x, y) # runs the forward pass, gets our predictions and how wrong they were
     loss.backward() # computes fresh hints (gradients) for every weight, based on this round's error
     optimizer.step() # nudges every weight using those hints
-    print(f"step {i}: loss {loss.item()}") # prints the loss so we can watch it go down each round
+    if device == "cuda":
+        torch.cuda.synchronize() # wait for the GPU to finish work
+    elif device == "mps":
+        torch.mps.synchronize() # wait for the GPU to finish work
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
