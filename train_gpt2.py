@@ -296,7 +296,9 @@ for i in range(50):
     x, y = train_loader.next_batch() # grabs a fresh batch of training data
     x, y = x.to(device), y.to(device) # moves the data onto the same hardware as the model, so it can be processed
     optimizer.zero_grad() # clears out the old hints from last round, so they don't pile up
-    logits, loss = model(x, y) # runs the forward pass, gets our predictions and how wrong they were
+    # runs the forward pass using faster, lower-precision numbers (bfloat16) wherever it's safe to, to speed things up
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward() # computes fresh hints (gradients) for every weight, based on this round's error
     optimizer.step() # nudges every weight using those hints
     if device == "cuda":
