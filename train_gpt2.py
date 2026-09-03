@@ -123,4 +123,120 @@ class GPT(nn.Module):
         # One score per possible token in the vocabulary
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    '''
+    Takes the raw token IDs all the way though the embeddings -> 12 blocks of attention + MLP -> final cleanup -> next token score predictions
+    In the end, optionally computes how wrong those predictions were, if correct answers are given
+    '''
+    def forward(self, idx, targets=None):
+        # idx is our batch of raw token ids, shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
+        # looks up each token's meaning (wte) and each position's info (wpe), then adds them together to get our starting x
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb
+
+        # runs x through all n_layer blocks (attention + mlp), updating it a bit more each time
+        for block in self.transformer.h:
+            x = block(x)
+
+        # final tidy up, then translate x into a score for every possible next token
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+
+        # if we were given the correct next tokens (training), figure out how wrong our guesses were
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+
+
+    '''
+    Utilizes our GPT2 model and populates it with trained GPT2 weights from Hugging Face
+    '''
+    @classmethod
+    def from_pretrained(cls, model_type):
+        """Loads pretrained GPT-2 model weights from huggingface"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        # picks the size settings (n_layer, n_head, n_embd) based on which gpt2 version we want
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        
+        # builds our own GPT class, currently just filled with random, untrained numbers
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+
+        # loads the real, already-trained gpt2 model from hugging face
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # makes sure our model's pieces line up with hugging face's before copying anything over
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        # hugging face stores these specific weights sideways (an old openai format), so we need to flip them before copying
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # flips the sideways weights, then copies them into our model
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # copies everything else over as-is, no flipping needed
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+
+# -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# picks the fastest hardware available to run on
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+# load a chunk of training text and tokenize it
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+
+# build our input (x) and target (y) batches - y is just x shifted over by one token
+B, T = 4, 32
+buf = torch.tensor(tokens[: B * T + 1])
+x = buf[:-1].view(B, T).to(device)
+y = buf[1:].view(B, T).to(device)
+
+# build a fresh, untrained model and run one forward pass to sanity check the output shape
+model = GPT(GPTConfig())
+model.to(device)
+# logits, loss = model(x, y)
+
+# updates the models weights during training. takes the 'hint' from the gradients and nudges every number in the direction that reduces the error
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+# repeats the guess, check, adjust cycle 50 times
+for i in range(50):
+    optimizer.zero_grad() # clears out the old hints from last round, so they don't pile up
+    logits, loss = model(x, y) # runs the forward pass, gets our predictions and how wrong they were
+    loss.backward() # computes fresh hints (gradients) for every weight, based on this round's error
+    optimizer.step() # nudges every weight using those hints
+    print(f"step {i}: loss {loss.item()}") # prints the loss so we can watch it go down each round
