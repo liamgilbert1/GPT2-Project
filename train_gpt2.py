@@ -312,10 +312,12 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 
+# the real batch size we want (matches gpt2/gpt3 papers), way bigger than what can actually fit in memory at once
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 16 # micro batch size
+B = 16 # micro batch size - the biggest chunk that actually fits in memory at once
 T = 1024 # sequence length
 assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+# how many small micro-batches we need to process and add up the gradients from, to equal one real batch
 grad_accum_steps = total_batch_size // (B * T)
 print(f"total desired batch size: {total_batch_size}")
 print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
@@ -357,15 +359,17 @@ for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad() # clears out the old hints from last round, so they don't pile up
 
+    # processes grad_accum_steps small micro-batches, adding up their gradients, to simulate one big total_batch_size batch
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
+        x, y = train_loader.next_batch() # grabs a fresh micro-batch of training data
+        x, y = x.to(device), y.to(device) # moves the data onto the same hardware as the model, so it can be processed
+        # runs the forward pass using faster, lower-precision numbers (bfloat16) wherever it's safe to, to speed things up
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        loss.backward()
+        loss = loss / grad_accum_steps # scales the loss down, so summing gradients across all micro-steps gives the correct average
+        loss_accum += loss.detach() # keeps a running total of the real loss, just for printing/tracking
+        loss.backward() # adds this micro-batch's gradients onto whatever's already there (no zero_grad in between, so they accumulate)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # caps how big the gradients can be overall, so one bad batch can't cause a huge, destabilizing update
     # updates and uses the learning rate based on where we are in training (warmup, decay, etc)
     lr = get_lr(step)
