@@ -312,7 +312,15 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 
-train_loader = DataLoaderLite(B=2, T=512)
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 16 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
 
 torch.set_float32_matmul_precision('high')
 
@@ -347,13 +355,17 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 # repeats the guess, check, adjust cycle 50 times
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch() # grabs a fresh batch of training data
-    x, y = x.to(device), y.to(device) # moves the data onto the same hardware as the model, so it can be processed
     optimizer.zero_grad() # clears out the old hints from last round, so they don't pile up
-    # runs the forward pass using faster, lower-precision numbers (bfloat16) wherever it's safe to, to speed things up
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward() # computes fresh hints (gradients) for every weight, based on this round's error
+
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # caps how big the gradients can be overall, so one bad batch can't cause a huge, destabilizing update
     # updates and uses the learning rate based on where we are in training (warmup, decay, etc)
     lr = get_lr(step)
@@ -366,6 +378,6 @@ for step in range(max_steps):
         torch.mps.synchronize() # wait for the GPU to finish work
     t1 = time.time()
     dt = t1 - t0 # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
     tokens_per_sec = tokens_processed / dt
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
