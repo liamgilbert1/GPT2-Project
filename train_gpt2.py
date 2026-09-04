@@ -288,7 +288,8 @@ model.to(device)
 model = torch.compile(model) # analyzes and fuses our model's operations ahead of time, so training runs faster
 
 # updates the models weights during training. takes the 'hint' from the gradients and nudges every number in the direction that reduces the error
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# betas/eps tuned to match the settings used in the original gpt2/gpt3 papers, instead of pytorch's defaults
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
 # repeats the guess, check, adjust cycle 50 times
 for i in range(50):
@@ -300,6 +301,7 @@ for i in range(50):
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward() # computes fresh hints (gradients) for every weight, based on this round's error
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # caps how big the gradients can be overall, so one bad batch can't cause a huge, destabilizing update
     optimizer.step() # nudges every weight using those hints
     if device == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
@@ -309,4 +311,4 @@ for i in range(50):
     dt = t1 - t0 # time difference in seconds
     tokens_processed = train_loader.B * train_loader.T
     tokens_per_sec = tokens_processed / dt
-    print(f"step {i:4d} | loss: {loss.item():.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
