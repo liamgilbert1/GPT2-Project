@@ -402,6 +402,7 @@ torch.set_float32_matmul_precision('high')
 
 # build a fresh, untrained model - vocab_size is padded up to a "nicer" number (multiple of 128) for the gpu, the extra slots just go unused
 model = GPT(GPTConfig(vocab_size=50304))
+# model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 # turned off for now - torch.compile causes an error in the hellaswag eval and generation code below that hasn't been fixed yet
 use_compile = False
@@ -414,7 +415,7 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # Phase 1 - warmup: linearly increase the learning rate from 0 up to max_lr
     if it < warmup_steps:
@@ -466,6 +467,16 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f: # "a" = append, so we don't erase everything logged so far
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            # every so often, save the model's weights to disk, so training progress isn't lost and we have something usable if it crashes
+            if step > 0 and (step % 5000 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(), # the actual learned weights
+                    'config': raw_model.config, # the settings needed to rebuild the same-shaped model later
+                    'step': step, # which step this checkpoint was saved at
+                    'val_loss': val_loss_accum.item() # how good the model was at this point
+                }
+                torch.save(checkpoint, checkpoint_path)
 
     # every so often, score the model on the HellaSwag benchmark - a standard, objective way to measure how good it really is
     if (step % 250 == 0 or last_step) and (not use_compile):
