@@ -358,10 +358,11 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+enc = tiktoken.get_encoding("gpt2") # used later on to encode/decode the sample generations
 
 # the real batch size we want (matches gpt2/gpt3 papers), way bigger than what can actually fit in memory at once
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size - the biggest chunk that actually fits in memory at once
+B = 32 # micro batch size - the biggest chunk that actually fits in memory at once
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -427,6 +428,36 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+
+    # every 100 steps, generate a few sample sentences so we can see how the model's writing is coming along (skip step 0, weights are still random)
+    # temporarily turned off (the trailing "and False") since torch.compile causes an error here that hasn't been fixed yet - works fine with torch.compile disabled
+    if step > 0 and step % 100 == 0 and False:
+        model.eval()
+        num_return_sequences = 4 # how many different continuations to generate
+        max_length = 32 # how long each one should get
+        # turns our starting prompt into token ids, then duplicates it so we get num_return_sequences separate generations
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        # makes the "randomness" repeatable, so we get the same results every time we rerun this (offset per gpu, so they don't all generate the exact same thing)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        # keeps generating one new token at a time until we hit max_length
+        while xgen.size(1) < max_length:
+            with torch.no_grad():
+                logits, loss = model(xgen) # run the current sequence through the model
+                logits = logits[:, -1, :] # only care about predicting what comes after the last token so far
+                probs = F.softmax(logits, dim=-1) # turn the raw scores into percentages that add up to 100%
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # narrow it down to the top 50 most likely next tokens
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # randomly pick one, weighted by how likely it is
+                xcol = torch.gather(topk_indices, -1, ix) # look up the actual token id that was picked
+                xgen = torch.cat((xgen, xcol), dim=1) # add the new token onto the end of the sequence, then repeat
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
 
     # training loop
     model.train()
