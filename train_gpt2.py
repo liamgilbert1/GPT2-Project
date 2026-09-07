@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 import os
+from hellaswag import render_example, iterate_examples # used later to score our model against the HellaSwag benchmark
 
 class CausalSelfAttention(nn.Module):
 
@@ -320,6 +321,30 @@ class DataLoaderLite:
             self.current_position = B * T * self.process_rank
         return x, y
 
+'''
+Each HellaSwag question has 4 possible endings. Picks whichever ending our model finds
+least surprising (lowest average loss) and returns which one that was
+'''
+def get_most_likely_row(tokens, mask, logits):
+    # shifts everything by one, same idea as our x/y setup - lines up each prediction with the token that should've come next
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    # gets the loss at every single position, instead of one averaged number
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+
+    # only keep the loss for the "ending" portion of each row (the mask marks where that is), ignore the shared context part
+    shift_mask = (mask[..., 1:]).contiguous()
+    masked_shift_losses = shift_losses * shift_mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1) # average loss per ending, so longer/shorter endings are compared fairly
+
+    # whichever of the 4 endings has the lowest average loss is our model's pick
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
 
 # -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -378,7 +403,10 @@ torch.set_float32_matmul_precision('high')
 # build a fresh, untrained model - vocab_size is padded up to a "nicer" number (multiple of 128) for the gpu, the extra slots just go unused
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-model = torch.compile(model) # analyzes and fuses our model's operations ahead of time, so training runs faster
+# turned off for now - torch.compile causes an error in the hellaswag eval and generation code below that hasn't been fixed yet
+use_compile = False
+if use_compile:
+    model = torch.compile(model) # analyzes and fuses our model's operations ahead of time, so training runs faster
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank]) # wraps the model so gradients automatically get synced/averaged across all the gpus
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model, so we can still call our own methods on it (like configure_optimizers)
@@ -406,12 +434,20 @@ def get_lr(it):
 # betas/eps tuned to match the settings used in the original gpt2/gpt3 papers, instead of pytorch's defaults
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
+# sets up a log file on disk to write our stats to, so we have a record beyond just what's printed to the console
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # opening in "w" mode just clears out any old log from a previous run
+    pass
+
 # repeats the guess, check, adjust cycle max_steps times
 for step in range(max_steps):
     t0 = time.time()
+    last_step = (step == max_steps - 1) # so we can always run our checks/eval on the very last step, not just every 250th one
 
     # every so often, check how the model does on held-out data it never trains on
-    if step % 100 == 0:
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -428,10 +464,42 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f: # "a" = append, so we don't erase everything logged so far
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
 
-    # every 100 steps, generate a few sample sentences so we can see how the model's writing is coming along (skip step 0, weights are still random)
-    # temporarily turned off (the trailing "and False") since torch.compile causes an error here that hasn't been fixed yet - works fine with torch.compile disabled
-    if step > 0 and step % 100 == 0 and False:
+    # every so often, score the model on the HellaSwag benchmark - a standard, objective way to measure how good it really is
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # each gpu only handles its own slice of the examples, so multiple gpus don't redo the same work
+            if i % ddp_world_size != ddp_rank:
+                continue
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits) # our model's guess at which of the 4 endings is correct
+            num_total += 1
+            num_correct_norm += int(pred_norm == label) # counts it if our guess matches the real answer
+        # combines each gpu's counts together, so we get one accuracy number across the whole benchmark, not just our own slice
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+
+    # every 250 steps, generate a few sample sentences so we can see how the model's writing is coming along (skip step 0, weights are still random)
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
         model.eval()
         num_return_sequences = 4 # how many different continuations to generate
         max_length = 32 # how long each one should get
@@ -446,7 +514,8 @@ for step in range(max_steps):
         # keeps generating one new token at a time until we hit max_length
         while xgen.size(1) < max_length:
             with torch.no_grad():
-                logits, loss = model(xgen) # run the current sequence through the model
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(xgen) # run the current sequence through the model
                 logits = logits[:, -1, :] # only care about predicting what comes after the last token so far
                 probs = F.softmax(logits, dim=-1) # turn the raw scores into percentages that add up to 100%
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # narrow it down to the top 50 most likely next tokens
@@ -495,6 +564,8 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        
+        with open(log_file, "a") as f: # also save the training loss to our log file, same as we do for val/hellaswag
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
+
 if ddp:
     destroy_process_group() # cleanly shuts down the multi-gpu setup now that training's done
