@@ -265,6 +265,7 @@ class GPT(nn.Module):
 import tiktoken
 import numpy as np
 
+# loads one shard's tokens from disk and turns them into a tensor we can slice batches from
 def load_tokens(filename):
     npt = np.load(filename)
     ptt = torch.tensor(npt, dtype=torch.long)
@@ -280,9 +281,9 @@ class DataLoaderLite:
         self.T = T # sequence length
         self.process_rank = process_rank # which process (gpu) this is, if training across multiple at once
         self.num_processes = num_processes # how many processes total, so they can split up the data without overlapping
-        assert split in {'train', 'val'}
+        assert split in {'train', 'val'} # train = what we learn from, val = held out data to check performance on
 
-        # get the shard filenames
+        # finds all the shard files for this split (train or val) and saves them, sorted, as a list
         data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
@@ -292,7 +293,10 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
+        self.reset()
 
+    # rewinds back to the very first shard, so we can re-run validation from the same starting point each time
+    def reset(self):
         # state, init at shard zero
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
@@ -366,6 +370,7 @@ if master_process:
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision('high')
 
@@ -403,6 +408,28 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 # repeats the guess, check, adjust cycle max_steps times
 for step in range(max_steps):
     t0 = time.time()
+
+    # every so often, check how the model does on held-out data it never trains on
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+    # training loop
+    model.train()
     optimizer.zero_grad() # clears out the old hints from last round, so they don't pile up
 
     # processes grad_accum_steps small micro-batches, adding up their gradients, to simulate one big total_batch_size batch
